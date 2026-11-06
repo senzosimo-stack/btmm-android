@@ -5,24 +5,27 @@
 - Persistent, visible manual-only statement.
 - UI tests for the manual-only boundary and Trade Desk copy.
 - Basic app scaffold: MainActivity.kt + BtmmApp.kt entry point.
+- BTMM engine (9-rule gate evaluation: HTF fan, price vs EMA, 8-EMA slope, TDI not extreme, TDI cross, spread cap, daily risk, D1 50 confluence, MFI momentum).
+- Storage layer with Room entities, DAOs, and repository for snapshots, trades, and events.
+- Unit characterization tests (BtmmEngineTest, BtmmRepositoryTest, BtmmTypesCharacterizationTest).
+- BTMM rules documentation (docs/btmm-rules.md).
+- Navigation and live-data configuration ready.
 
 ## Not included
-- BTMM engine (rule evaluation, state classification, ghost trade generation).
-- Storage layer (Room entities, database, DAOs, snapshot/trade/event persistence).
-- Unit characterization tests (BtmmEngineTest, BtmmRepositoryTest, etc.).
-- BTMM rules documentation (docs/btmm-rules.md not on this branch).
-- Market data integration, broker connection, or order placement.
+- Market data integration (live feed), broker connection, or order placement.
 - Automated trade execution or backend services.
+- Account management features within the app.
+- Secrets embedded in source — credentials stored encrypted in preferences only.
 
 ## Next steps
-1. Add BTMM engine package (BtmmEngine.kt with 9-rule gate evaluation).
-2. Add BTMM types package (BtmmTypes.kt with domain types).
-3. Add Room storage entities (BtmmEntities.kt, BtmmDatabase.kt, BtmmRepository.kt, BtmmDaos.kt).
-4. Add characterization/unit tests.
-5. Add docs/btmm-rules.md with rule definitions and examples.
-6. Wire engine to Dashboard shell in BtmmApp.kt.
-7. Consider live data later (credential protection plan).
-8. Prepare a release (Gradle fix, device testing, signing).
+1. Wire engine to Dashboard shell in BtmmApp.kt (state/gate badges, ghost trade display).
+2. Add Settings screen for live data endpoint and API key (encrypted storage).
+3. Test on physical Android device (or emulator with Play Services).
+4. Privacy & security review: no keys in source, encrypted prefs only, manual-only disclaimer visible.
+5. Prepare release: signed APK/AAB, device testing, Gradle cleanup.
 
 ## Completed phases
-- 🔶 Initial shell scaffold (MainActivity + BtmmApp + four-tab Compose UI).
+- 🔶 Initial shell scaffold (MainActivity + BtmmApp + four-tab Compose UI)
+- 🔶 BTMM engine and types ported (9-rule gate evaluation)
+- 🔶 Room storage entities, DAOs, and repository implemented
+- 🔶 Unit characterization tests added
