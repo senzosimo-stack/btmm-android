@@ -1,399 +1,314 @@
 package com.btmm.mobile.btmm
 
-import kotlin.math.*
+import kotlin.math.max
+
+/**
+ * Values the user reads off their own chart and types in. null = not entered.
+ * Nothing here is fetched from a feed, and nothing is assumed when a value is missing.
+ */
+data class ManualReading(
+    val symbol: String = "",
+    val timeframe: Timeframe = Timeframe.H1,
+    val price: Double? = null,
+    val ema8: Double? = null,
+    val ema8Prev: Double? = null,
+    val ema50: Double? = null,
+    val ema200: Double? = null,
+    val ema1200: Double? = null,
+    val rsi: Double? = null,
+    val tdiCross: TdiCross? = null,
+    val mfi: Double? = null,
+    val mfiPrev: Double? = null,
+    val spreadPoints: Double? = null,
+    val newsLocked: Boolean? = null,
+    val dailyPl: Double? = null,
+    val account: Double? = null,
+    /** Optional. Only used to size the reference levels. */
+    val atr: Double? = null
+) {
+    fun hasAnyInput(): Boolean =
+        listOf(price, ema8, ema8Prev, ema50, ema200, ema1200, rsi, mfi, mfiPrev, spreadPoints, dailyPl, account, atr)
+            .any { it != null } || tdiCross != null || newsLocked != null
+}
+
+data class RuleResult(val id: Int, val name: String, val status: RuleStatus, val detail: String)
+
+/** Reference distances for a gate-open reading. Not an order, not advice. */
+data class ReferenceLevels(
+    val direction: Bias,
+    val entry: Double,
+    val stopLoss: Double,
+    val takeProfit: Double,
+    val riskAmount: Double
+)
+
+data class Assessment(
+    val verdict: Verdict,
+    val rules: List<RuleResult>,
+    /** null = could not be determined from the entered values. */
+    val bias: Bias?,
+    /** null = could not be determined. */
+    val score: Int?,
+    /** 0..3 entries per docs/btmm-rules.md; null = could not be determined. */
+    val entries: Int?,
+    val reference: ReferenceLevels?,
+    val errors: List<String>,
+    val missingInputs: List<String>
+) {
+    val rulesPassed: Int get() = rules.count { it.status == RuleStatus.PASS }
+    val rulesFailed: Int get() = rules.count { it.status == RuleStatus.FAIL }
+    val rulesNotChecked: Int get() = rules.count { it.status == RuleStatus.MISSING }
+}
 
 object BtmmEngine {
 
-    fun evaluate(world: World, pair: PairInfo): EngineSnap {
-        val candles = world.candles
-        if (candles.size < 200) return emptySnap(world, pair)
-
-        val closes = candles.map { it.close }
-        val highs = candles.map { it.high }
-        val lows = candles.map { it.low }
-
-        val ema8 = ema(closes, 8)
-        val ema50 = ema(closes, 50)
-        val ema200 = ema(closes, 200)
-        val ema1200 = ema(closes, 1200)
-
-        val atr = atr(candles, 14)
-        val atrPips = atr / pair.pip
-        val atrPct = atr / closes.last() * 100
-
-        val rsi = rsi(closes, 14)
-        val (tdiSig, tdiUp, tdiLo) = tdi(candles, closes)
-        val mfi = mfi(candles, 14)
-
-        val bias = computeBias(closes.last(), ema50, ema200, ema1200, ema8)
-        val biasScore = computeBiasScore(bias, closes.last(), ema50, ema200, ema1200, ema8, rsi, mfi)
-
-        val cond200 = if (bias == Bias.LONG) closes.last() > ema200 else closes.last() < ema200
-        val cond50 = if (bias == Bias.LONG) closes.last() > ema50 else closes.last() < ema50
-        val cond8 = if (bias == Bias.LONG) ema8 > ema8Prev(closes, 8) else ema8 < ema8Prev(closes, 8)
-
-        val rules = evaluateRules(
-            bias = bias,
-            price = closes.last(),
-            ema50 = ema50,
-            ema8 = ema8,
-            ema8Prev = ema8Prev(closes, 8),
-            tdiSig = tdiSig,
-            rsi = rsi,
-            spread = world.liveStatus,
-            account = world.account,
-            dailyPL = world.dailyPL,
-            mfi = mfi,
-            mfiPrev = mfiPrev(candles, 14)
-        )
-
-        val gateOpen = rules.all { it.pass }
-        val rulesPassed = rules.count { it.pass }
-
-        val state = classifyState(
-            atr = atr,
-            candles = candles,
-            price = closes.last(),
-            safety = rules[6].pass, // placeholder; real safety is separate
-            tdiCross = rules[4].pass,
-            emaCross = cond8
-        )
-
-        val tier = scoreToTier(biasScore)
-        val dwatScore = biasScore
-        val riskPct = TIER_RISK[tier] ?: 1.0
-
-        val tdiReload = when {
-            rsi < 30 -> TdiReload.OVERSOLD
-            rsi > 70 -> TdiReload.OVERBOUGHT
-            atrPct < 0.1 -> TdiReload.SQUEEZE
-            else -> TdiReload.NONE
+    fun evaluate(r: ManualReading): Assessment {
+        val errors = validate(r)
+        if (errors.isNotEmpty()) {
+            return Assessment(Verdict.INVALID, emptyList(), null, null, null, null, errors, emptyList())
+        }
+        if (!r.hasAnyInput()) {
+            return Assessment(Verdict.NO_DATA, emptyList(), null, null, null, null, emptyList(), requiredMissing(r))
         }
 
-        val mfiConfirm = (bias == Bias.LONG && mfi > mfiPrev(candles, 14)) ||
-                (bias == Bias.SHORT && mfi < mfiPrev(candles, 14))
-
-        val today = dailyRange(candles.takeLast(1))
-        val yest = dailyRange(candles.takeLast(2))
-
-        val profile = volumeProfile(candles)
-
-        val sessions = Sessions(
-            asia = true, // placeholder
-            london = true,
-            ny = true,
-            asiaHigh = highs.maxOrNull() ?: 0.0,
-            asiaLow = lows.minOrNull() ?: 0.0
+        val bias = computeBias(r)
+        val rules = listOf(
+            rule1(bias), rule2(r, bias), rule3(r, bias), rule4(r), rule5(r, bias),
+            rule6(r), rule7(r), rule8(bias), rule9(r, bias)
         )
+        val missing = requiredMissing(r)
+        val score = computeScore(r, bias)
+        val entries = score?.let { entriesForScore(it) }
 
-        val ghost = if (bias != Bias.NONE && biasScore >= 65 && gateOpen) {
-            val slDist = min(atr * 1.5, today.mid - today.low).coerceAtLeast(atr * 0.5)
-            val tpDist = slDist * MIN_RR
-            val entry = closes.last()
-            val sl = if (bias == Bias.LONG) entry - slDist else entry + slDist
-            val tp = if (bias == Bias.LONG) entry + tpDist else entry - tpDist
-            val riskAmt = world.account * 1.0 / 100.0
-            val lots = riskAmt / (slDist / pair.pip * 10) // rough lot calc
-            GhostTrade(
-                dir = bias,
-                entry = entry,
-                sl = sl,
-                tp = tp,
-                lots = lots,
-                riskAmt = riskAmt,
-                rr = MIN_RR
-            )
-        } else null
-
-        val mtf = MtfBias(
-            m15 = bias,
-            h1 = bias,
-            h4 = bias,
-            d1 = bias
-        )
-
-        val news = world.events.lastOrNull { it.kind == EventKind.NEWS }?.let {
-            NewsItem(
-                title = it.title,
-                impact = NewsImpact.RED,
-                time = System.currentTimeMillis(),
-                locked = false
-            )
+        val verdict = when {
+            rules.any { it.status == RuleStatus.FAIL } -> Verdict.GATE_CLOSED
+            rules.any { it.status == RuleStatus.MISSING } -> Verdict.INCOMPLETE
+            else -> Verdict.GATE_OPEN
         }
 
-        val hod = highs.maxOrNull() ?: 0.0
-        val lod = lows.minOrNull() ?: 0.0
+        val reference =
+            if (verdict == Verdict.GATE_OPEN && bias != null && bias != Bias.NONE &&
+                score != null && score >= MIN_ENTRY_SCORE
+            ) referenceLevels(r, bias) else null
 
-        return EngineSnap(
-            price = closes.last(),
-            bid = closes.last() - world.liveStatus.name.length.toDouble() * 0.0001,
-            ask = closes.last() + world.liveStatus.name.length.toDouble() * 0.0001,
-            spreadPts = if (world.liveStatus == LiveStatus.CONNECTED) 15 else 0,
-            ema8 = ema8,
-            ema50 = ema50,
-            ema200 = ema200,
-            ema1200 = ema1200,
-            ema8Prev = ema8Prev(closes, 8),
-            atr = atr,
-            atrPips = atrPips,
-            atrPct = atrPct,
-            rsi = rsi,
-            tdiSig = tdiSig,
-            tdiUp = tdiUp,
-            tdiLo = tdiLo,
-            mfi = mfi,
-            bias = bias,
-            biasScore = biasScore,
-            cond200 = cond200,
-            cond50 = cond50,
-            cond8 = cond8,
-            state = state,
-            rules = rules,
-            gateOpen = gateOpen,
-            rulesPassed = rulesPassed,
-            tier = tier,
-            dwatScore = dwatScore,
-            riskPct = riskPct,
-            tdiReload = tdiReload,
-            mfiConfirm = mfiConfirm,
-            today = today,
-            yest = yest,
-            profile = profile,
-            sessions = sessions,
-            ghost = ghost,
-            mtf = mtf,
-            news = news,
-            hod = hod,
-            lod = lod
-        )
+        return Assessment(verdict, rules, bias, score, entries, reference, emptyList(), missing)
     }
 
-    private fun emptySnap(world: World, pair: PairInfo): EngineSnap {
-        return EngineSnap(
-            price = 0.0,
-            bid = 0.0,
-            ask = 0.0,
-            spreadPts = 0,
-            ema8 = 0.0,
-            ema50 = 0.0,
-            ema200 = 0.0,
-            ema1200 = 0.0,
-            ema8Prev = 0.0,
-            atr = 0.0,
-            atrPips = 0.0,
-            atrPct = 0.0,
-            rsi = 0.0,
-            tdiSig = 0.0,
-            tdiUp = 0.0,
-            tdiLo = 0.0,
-            mfi = 0.0,
-            bias = Bias.NONE,
-            biasScore = 0,
-            cond200 = false,
-            cond50 = false,
-            cond8 = false,
-            state = BtmmState.NONE,
-            rules = emptyList(),
-            gateOpen = false,
-            rulesPassed = 0,
-            tier = DwatTier.T1,
-            dwatScore = 0,
-            riskPct = 1.0,
-            tdiReload = TdiReload.NONE,
-            mfiConfirm = false,
-            today = DailyRange(0.0, 0.0, 0.0, 0.0),
-            yest = DailyRange(0.0, 0.0, 0.0, 0.0),
-            profile = VolumeArea(0.0, 0.0, 0.0, null, 0),
-            sessions = Sessions(false, false, false, 0.0, 0.0),
-            ghost = null,
-            mtf = MtfBias(Bias.NONE, Bias.NONE, Bias.NONE, Bias.NONE),
-            news = null,
-            hod = 0.0,
-            lod = 0.0
-        )
-    }
+    // ---- validation ----
 
-    private fun ema(values: List<Double>, period: Int): Double {
-        if (values.size < period) return values.lastOrNull() ?: 0.0
-        val k = 2.0 / (period + 1)
-        var ema = values.take(period).average()
-        for (i in period until values.size) {
-            ema = values[i] * k + ema * (1 - k)
+    private fun validate(r: ManualReading): List<String> {
+        val e = mutableListOf<String>()
+        fun finite(label: String, v: Double?) {
+            if (v != null && !v.isFinite()) e += "$label is not a finite number"
         }
-        return ema
-    }
-
-    private fun ema8Prev(values: List<Double>, period: Int): Double {
-        if (values.size < period + 1) return values.lastOrNull() ?: 0.0
-        val k = 2.0 / (period + 1)
-        var ema = values.take(period).average()
-        for (i in period until values.size - 1) {
-            ema = values[i] * k + ema * (1 - k)
+        fun positive(label: String, v: Double?) {
+            if (v != null && v.isFinite() && v <= 0.0) e += "$label must be greater than 0"
         }
-        return ema
-    }
-
-    private fun atr(candles: List<Candle>, period: Int): Double {
-        if (candles.size < 2) return 0.0
-        val trs = candles.zipWithNext { a, b ->
-            maxOf(
-                b.high - b.low,
-                abs(b.high - a.close),
-                abs(b.low - a.close)
-            )
+        fun range0to100(label: String, v: Double?) {
+            if (v != null && v.isFinite() && (v < 0.0 || v > 100.0)) e += "$label must be between 0 and 100"
         }
-        if (trs.isEmpty()) return 0.0
-        return trs.takeLast(period).average()
+        listOf(
+            "Price" to r.price, "EMA 8" to r.ema8, "EMA 8 (previous bar)" to r.ema8Prev,
+            "EMA 50" to r.ema50, "EMA 200" to r.ema200, "EMA 1200" to r.ema1200,
+            "RSI" to r.rsi, "MFI" to r.mfi, "MFI (previous bar)" to r.mfiPrev,
+            "Spread" to r.spreadPoints, "Daily P/L" to r.dailyPl, "Account" to r.account, "ATR" to r.atr
+        ).forEach { (label, v) -> finite(label, v) }
+
+        listOf(
+            "Price" to r.price, "EMA 8" to r.ema8, "EMA 8 (previous bar)" to r.ema8Prev,
+            "EMA 50" to r.ema50, "EMA 200" to r.ema200, "EMA 1200" to r.ema1200,
+            "Account" to r.account, "ATR" to r.atr
+        ).forEach { (label, v) -> positive(label, v) }
+
+        listOf("RSI" to r.rsi, "MFI" to r.mfi, "MFI (previous bar)" to r.mfiPrev)
+            .forEach { (label, v) -> range0to100(label, v) }
+
+        val s = r.spreadPoints
+        if (s != null && s.isFinite() && s < 0.0) e += "Spread cannot be negative"
+        return e
     }
 
-    private fun rsi(values: List<Double>, period: Int): Double {
-        if (values.size < period + 1) return 50.0
-        val changes = values.zipWithNext { a, b -> b - a }
-        val gains = changes.map { if (it > 0) it else 0.0 }
-        val losses = changes.map { if (it < 0) -it else 0.0 }
-        val avgGain = gains.takeLast(period).average()
-        val avgLoss = losses.takeLast(period).average()
-        if (avgLoss == 0.0) return 100.0
-        val rs = avgGain / avgLoss
-        return 100 - 100 / (1 + rs)
+    private fun requiredMissing(r: ManualReading): List<String> = buildList {
+        if (r.price == null) add("Price")
+        if (r.ema8 == null) add("EMA 8")
+        if (r.ema8Prev == null) add("EMA 8 (previous bar)")
+        if (r.ema50 == null) add("EMA 50")
+        if (r.ema200 == null) add("EMA 200")
+        if (r.ema1200 == null) add("EMA 1200")
+        if (r.rsi == null) add("RSI")
+        if (r.tdiCross == null) add("TDI cross")
+        if (r.mfi == null) add("MFI")
+        if (r.mfiPrev == null) add("MFI (previous bar)")
+        if (r.spreadPoints == null) add("Spread")
+        if (r.newsLocked == null) add("News lock")
+        if (r.dailyPl == null) add("Daily P/L")
+        if (r.account == null) add("Account")
     }
 
-    private fun tdi(candles: List<Candle>, closes: List<Double>): Triple<Double, Double, Double> {
-        val rsiLine = rsi(closes, 14)
-        val signal = ema(closes, 18) // placeholder signal
-        val up = rsiLine + 5
-        val lo = rsiLine - 5
-        return Triple(signal, up, lo)
-    }
+    // ---- bias ----
 
-    private fun mfi(candles: List<Candle>, period: Int): Double {
-        if (candles.size < period + 1) return 50.0
-        val typical = candles.map { (it.high + it.low + it.close) / 3 }
-        val raw = typical.zip(candles.map { it.volume }) { p, v -> p * v }
-        val changes = raw.zipWithNext { a, b -> b - a }
-        val pos = changes.filter { it > 0 }.sum()
-        val neg = changes.filter { it < 0 }.sum().absoluteValue
-        if (neg == 0.0) return 100.0
-        val mfRatio = pos / neg
-        return 100 - 100 / (1 + mfRatio)
-    }
-
-    private fun mfiPrev(candles: List<Candle>, period: Int): Double {
-        if (candles.size < period + 2) return 50.0
-        val sub = candles.dropLast(1)
-        return mfi(sub, period)
-    }
-
-    private fun computeBias(price: Double, ema50: Double, ema200: Double, ema1200: Double, ema8: Double): Bias {
+    /** null when any of price, EMA 8/50/200/1200 is missing: bias is unknown, not "none". */
+    private fun computeBias(r: ManualReading): Bias? {
+        val p = r.price ?: return null
+        val e8 = r.ema8 ?: return null
+        val e50 = r.ema50 ?: return null
+        val e200 = r.ema200 ?: return null
+        val e1200 = r.ema1200 ?: return null
         return when {
-            price > ema50 && price > ema200 && price > ema1200 && ema8 > ema50 -> Bias.LONG
-            price < ema50 && price < ema200 && price < ema1200 && ema8 < ema50 -> Bias.SHORT
+            p > e50 && p > e200 && p > e1200 && e8 > e50 -> Bias.LONG
+            p < e50 && p < e200 && p < e1200 && e8 < e50 -> Bias.SHORT
             else -> Bias.NONE
         }
     }
 
-    private fun computeBiasScore(
-        bias: Bias,
-        price: Double,
-        ema50: Double,
-        ema200: Double,
-        ema1200: Double,
-        ema8: Double,
-        rsi: Double,
-        mfi: Double
-    ): Int {
-        if (bias == Bias.NONE) return 0
-        var score = 40
-        if (bias == Bias.LONG && price > ema50) score += 10
-        if (bias == Bias.SHORT && price < ema50) score += 10
-        if (bias == Bias.LONG && price > ema200) score += 10
-        if (bias == Bias.SHORT && price < ema200) score += 10
-        if (bias == Bias.LONG && ema8 > ema50) score += 10
-        if (bias == Bias.SHORT && ema8 < ema50) score += 10
-        if (rsi in 40.0..60.0) score += 10
-        if (mfi in 40.0..60.0) score += 10
-        return score.coerceIn(0, 100)
+    // ---- rules (docs/btmm-rules.md, "9-rule gate") ----
+
+    private fun pass(id: Int, name: String, detail: String) = RuleResult(id, name, RuleStatus.PASS, detail)
+    private fun fail(id: Int, name: String, detail: String) = RuleResult(id, name, RuleStatus.FAIL, detail)
+    private fun missing(id: Int, name: String, needs: String) =
+        RuleResult(id, name, RuleStatus.MISSING, "Not checked: needs $needs")
+
+    private const val BIAS_NEEDS = "price and EMA 8, 50, 200, 1200"
+
+    private fun rule1(bias: Bias?): RuleResult = when (bias) {
+        null -> missing(1, "HTF 200/1200 fan", BIAS_NEEDS)
+        Bias.NONE -> fail(1, "HTF 200/1200 fan", "Price and EMAs do not line up long or short")
+        else -> pass(1, "HTF 200/1200 fan", "Bias is $bias")
     }
 
-    private fun evaluateRules(
-        bias: Bias,
-        price: Double,
-        ema50: Double,
-        ema8: Double,
-        ema8Prev: Double,
-        tdiSig: Double,
-        rsi: Double,
-        spread: LiveStatus,
-        account: Double,
-        dailyPL: Double,
-        mfi: Double,
-        mfiPrev: Double
-    ): List<RuleResult> {
-        val newsLocked = false // placeholder
-        val spreadOk = spread != LiveStatus.CONNECTED || true // placeholder spread check
-        val riskOk = abs(dailyPL) / account * 100 < MAX_DAILY_RISK
+    private fun rule2(r: ManualReading, bias: Bias?): RuleResult {
+        val name = "Price vs 50 EMA"
+        val price = r.price
+        val e50 = r.ema50
+        if (bias == null || price == null || e50 == null) return missing(2, name, BIAS_NEEDS)
+        return when {
+            bias == Bias.NONE -> fail(2, name, "No bias to align with")
+            bias == Bias.LONG && price > e50 -> pass(2, name, "Long and price is above EMA 50")
+            bias == Bias.SHORT && price < e50 -> pass(2, name, "Short and price is below EMA 50")
+            else -> fail(2, name, "Price is on the wrong side of EMA 50 for $bias")
+        }
+    }
 
-        return listOf(
-            RuleResult(1, "HTF fan", "R1", bias != Bias.NONE),
-            RuleResult(2, "Price vs 50", "R2", (bias == Bias.LONG && price > ema50) || (bias == Bias.SHORT && price < ema50)),
-            RuleResult(3, "8-EMA slope", "R3", (bias == Bias.LONG && ema8 > ema8Prev) || (bias == Bias.SHORT && ema8 < ema8Prev)),
-            RuleResult(4, "TDI not extreme", "R4", !((bias == Bias.LONG && rsi < 30) || (bias == Bias.LONG && rsi > 70) || (bias == Bias.SHORT && rsi > 70) || (bias == Bias.SHORT && rsi < 30))),
-            RuleResult(5, "TDI cross", "R5", (bias == Bias.LONG && tdiUp > tdiSig) || (bias == Bias.SHORT && tdiUp < tdiSig)),
-            RuleResult(6, "Spread cap", "R6", spreadOk && !newsLocked),
-            RuleResult(7, "Daily risk", "R7", riskOk),
-            RuleResult(8, "D1 50 confluence", "R8", bias != Bias.NONE),
-            RuleResult(9, "MFI momentum", "R9", (bias == Bias.LONG && mfi > mfiPrev) || (bias == Bias.SHORT && mfi < mfiPrev))
+    private fun rule3(r: ManualReading, bias: Bias?): RuleResult {
+        val name = "8-EMA slope"
+        val e8 = r.ema8
+        val prev = r.ema8Prev
+        if (bias == null || e8 == null || prev == null) return missing(3, name, "$BIAS_NEEDS, and EMA 8 (previous bar)")
+        return when {
+            bias == Bias.NONE -> fail(3, name, "No bias to align with")
+            bias == Bias.LONG && e8 > prev -> pass(3, name, "EMA 8 is rising")
+            bias == Bias.SHORT && e8 < prev -> pass(3, name, "EMA 8 is falling")
+            else -> fail(3, name, "EMA 8 is not moving with $bias (flat counts as fail)")
+        }
+    }
+
+    /** Fails on RSI < 30 or > 70, in either direction (matches the documented examples). */
+    private fun rule4(r: ManualReading): RuleResult {
+        val name = "TDI not extreme"
+        val rsi = r.rsi ?: return missing(4, name, "RSI")
+        return if (rsi < 30.0 || rsi > 70.0) fail(4, name, "RSI ${plain(rsi)} is outside 30 to 70")
+        else pass(4, name, "RSI ${plain(rsi)} is inside 30 to 70")
+    }
+
+    private fun rule5(r: ManualReading, bias: Bias?): RuleResult {
+        val name = "TDI cross with bias"
+        val cross = r.tdiCross
+        if (bias == null || cross == null) return missing(5, name, "$BIAS_NEEDS, and TDI cross")
+        return when {
+            bias == Bias.NONE -> fail(5, name, "No bias to align with")
+            bias == Bias.LONG && cross == TdiCross.UP -> pass(5, name, "TDI crossed up")
+            bias == Bias.SHORT && cross == TdiCross.DOWN -> pass(5, name, "TDI crossed down")
+            else -> fail(5, name, "TDI cross is ${cross.name.lowercase()}, which does not match $bias")
+        }
+    }
+
+    private fun rule6(r: ManualReading): RuleResult {
+        val name = "Spread cap / news"
+        val spread = r.spreadPoints
+        val locked = r.newsLocked
+        if (locked == true) return fail(6, name, "News is locked")
+        if (spread != null && spread > MAX_SPREAD_POINTS) {
+            return fail(6, name, "Spread ${plain(spread)} is above ${plain(MAX_SPREAD_POINTS)} points")
+        }
+        if (spread == null || locked == null) return missing(6, name, "spread and news lock")
+        return pass(6, name, "Spread ${plain(spread)} is within ${plain(MAX_SPREAD_POINTS)} points and news is not locked")
+    }
+
+    /** Only a loss counts. A profitable day never fails this rule. */
+    private fun rule7(r: ManualReading): RuleResult {
+        val name = "Daily risk limit"
+        val pl = r.dailyPl
+        val account = r.account
+        if (pl == null || account == null) return missing(7, name, "daily P/L and account")
+        val lossPct = max(0.0, -pl) / account * 100.0
+        return if (lossPct < MAX_DAILY_LOSS_PCT) pass(7, name, "Daily loss is ${plain(lossPct)}% (limit ${plain(MAX_DAILY_LOSS_PCT)}%)")
+        else fail(7, name, "Daily loss is ${plain(lossPct)}% (limit ${plain(MAX_DAILY_LOSS_PCT)}%)")
+    }
+
+    /** Per docs this mirrors rule 1: there is no separate D1 50 EMA input yet. */
+    private fun rule8(bias: Bias?): RuleResult = when (bias) {
+        null -> missing(8, "D1 50 EMA confluence", BIAS_NEEDS)
+        Bias.NONE -> fail(8, "D1 50 EMA confluence", "No bias (this rule currently mirrors rule 1)")
+        else -> pass(8, "D1 50 EMA confluence", "Bias present (this rule currently mirrors rule 1)")
+    }
+
+    private fun rule9(r: ManualReading, bias: Bias?): RuleResult {
+        val name = "MFI momentum"
+        val mfi = r.mfi
+        val prev = r.mfiPrev
+        if (bias == null || mfi == null || prev == null) return missing(9, name, "$BIAS_NEEDS, MFI and MFI (previous bar)")
+        return when {
+            bias == Bias.NONE -> fail(9, name, "No bias to align with")
+            bias == Bias.LONG && mfi > prev -> pass(9, name, "MFI is rising")
+            bias == Bias.SHORT && mfi < prev -> pass(9, name, "MFI is falling")
+            else -> fail(9, name, "MFI is not moving with $bias (flat counts as fail)")
+        }
+    }
+
+    // ---- score and entries ----
+
+    /**
+     * Same formula as the prototype: 40 base, +10 each for price vs 50, price vs 200, EMA 8 vs 50
+     * (always true once a bias exists), +10 RSI in 40..60, +10 MFI in 40..60.
+     * So with a bias the result is 70, 80 or 90; below the 65 threshold is unreachable.
+     * Returns null when it cannot be computed from what was entered.
+     */
+    private fun computeScore(r: ManualReading, bias: Bias?): Int? {
+        if (bias == null) return null
+        if (bias == Bias.NONE) return 0
+        val rsi = r.rsi ?: return null
+        val mfi = r.mfi ?: return null
+        var score = 40 + 30
+        if (rsi in 40.0..60.0) score += 10
+        if (mfi in 40.0..60.0) score += 10
+        return score
+    }
+
+    fun entriesForScore(score: Int): Int = when {
+        score >= 86 -> 3
+        score >= 76 -> 2
+        score >= MIN_ENTRY_SCORE -> 1
+        else -> 0
+    }
+
+    // ---- reference levels ----
+
+    /** Needs ATR and account; SL = 1.5 x ATR, TP = SL x 1.5, risk = 1% of account. */
+    private fun referenceLevels(r: ManualReading, bias: Bias): ReferenceLevels? {
+        val price = r.price ?: return null
+        val atr = r.atr ?: return null
+        val account = r.account ?: return null
+        val slDist = atr * SL_ATR_MULTIPLE
+        val tpDist = slDist * MIN_RR
+        val long = bias == Bias.LONG
+        return ReferenceLevels(
+            direction = bias,
+            entry = price,
+            stopLoss = if (long) price - slDist else price + slDist,
+            takeProfit = if (long) price + tpDist else price - tpDist,
+            riskAmount = account * RISK_PER_TRADE_PCT / 100.0
         )
     }
 
-    private fun classifyState(
-        atr: Double,
-        candles: List<Candle>,
-        price: Double,
-        safety: Boolean,
-        tdiCross: Boolean,
-        emaCross: Boolean
-    ): BtmmState {
-        val atr0 = atr
-        val atr1 = atr * 1.1
-        val atr2 = atr * 1.2
-        val range5 = candles.takeLast(5).maxOf { it.high } - candles.takeLast(5).minOf { it.low }
-
-        return when {
-            safety && tdiCross && emaCross -> BtmmState.AR
-            safety && (tdiCross || emaCross) -> BtmmState.SAFETY
-            tdiCross -> BtmmState.TDI
-            emaCross -> BtmmState.CROSS
-            atr0 < atr1 && atr1 < atr2 -> BtmmState.STATIC
-            range5 < 1.5 * atr0 -> BtmmState.TRAP
-            else -> BtmmState.ANCHOR
-        }
-    }
-
-    private fun scoreToTier(score: Int): DwatTier {
-        return when {
-            score >= 86 -> DwatTier.T7
-            score >= 76 -> DwatTier.T6
-            score >= 65 -> DwatTier.T5
-            score >= 50 -> DwatTier.T3
-            score >= 35 -> DwatTier.T2
-            else -> DwatTier.T1
-        }
-    }
-
-    private fun dailyRange(candles: List<Candle>): DailyRange {
-        if (candles.isEmpty()) return DailyRange(0.0, 0.0, 0.0, 0.0)
-        val high = candles.maxOf { it.high }
-        val low = candles.minOf { it.low }
-        val range = high - low
-        return DailyRange(high, low, range, (high + low) / 2)
-    }
-
-    private fun volumeProfile(candles: List<Candle>): VolumeArea {
-        if (candles.isEmpty()) return VolumeArea(0.0, 0.0, 0.0, null, 0)
-        val vah = candles.maxOf { it.high }
-        val val = candles.minOf { it.low }
-        val poc = (vah + val) / 2
-        return VolumeArea(vah, poc, val, null, 0)
-    }
+    private fun plain(v: Double): String = java.math.BigDecimal.valueOf(v).stripTrailingZeros().toPlainString()
 }
